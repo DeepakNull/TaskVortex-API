@@ -197,7 +197,7 @@ class TaskService:
 
         for task in tasks:
             tasks_data.append({
-                "id": task.id,
+                "id": str(task.id),
                 "title": task.title,
                 "description": task.description,
                 "status": task.status.value,

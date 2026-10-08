@@ -1,27 +1,28 @@
 import asyncio
 import json
 import logging
-import time 
+import time
 
 import aio_pika
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.exc import OperationalError
 
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.core.logging import listener, setup_logging
+from app.core.redis import redis_client
 from app.models.task import TaskStatus
 from app.repository.metrics_cache_repository import MetricsCacheRepository
 from app.repository.metrics_repository import MetricsRepository
 from app.repository.task_repository import TaskRepository
-from app.core.redis import redis_client
-
-
-import logging 
 
 logger = logging.getLogger(__name__)
 
+
 async def process_heavy_task():
     await asyncio.sleep(5)
-    
+
+
 @retry(
     retry=retry_if_exception_type(OperationalError),
     wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -30,6 +31,13 @@ async def process_heavy_task():
 async def _fetch_task_with_retry(repo: TaskRepository, task_id):
     return await repo.get_task_for_processing(task_id)
 
+
+async def _invalidate_history_cache(user_id) -> None:
+    keys = [k async for k in redis_client.scan_iter(match=f"task_history:{user_id}:*")]
+    if keys:
+        await redis_client.delete(*keys)
+
+
 async def process_message(message: aio_pika.IncomingMessage):
     async with message.process():
         try:
@@ -37,17 +45,10 @@ async def process_message(message: aio_pika.IncomingMessage):
             task_id = body["task_id"]
         except (json.JSONDecodeError, KeyError):
             logger.exception("Malformed message, dropping")
-            return 
-        
-        logger.info(
-            "Message received",
-            extra={
-                "context": {
-                    # "tracking_token": body["tracking_token"],
-                    "task_id": task_id,
-                }
-            },
-        )
+            return
+
+        ctx = {"context": {"task_id": task_id}}
+        logger.info("Message received", extra=ctx)
 
         async with AsyncSessionLocal() as db:
             repo = TaskRepository(db)
@@ -56,97 +57,77 @@ async def process_message(message: aio_pika.IncomingMessage):
 
             try:
                 task = await _fetch_task_with_retry(repo, task_id)
-            except OperationalError:  #later add something so, that we know that the db was down or something so, that it can be hanlded.
-                # DB unreachable after 3 retries — this IS the case we
-                # want to actually escalate. Let it propagate so the
-                # message nacks and we don't silently pretend it worked.
-                logger.exception(
-                    "DB unreachable after retries", extra={"context": {"task_id": task_id}}
-                )
-                raise 
-            
+            except OperationalError:
+                logger.exception("DB unreachable after retries", extra=ctx)
+                raise
+
             if task is None:
-                logger.warning("Task not found, dropping message", extra={"context": {"task_id": task_id}})
+                logger.warning("Task not found, dropping message", extra=ctx)
                 return
-            
+
             if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                logger.info("Duplicate delivery ignored", extra={"context": {"task_id": task_id}})
+                logger.info("Duplicate delivery ignored", extra=ctx)
                 return
-            
+
+            # Capture before any commit/rollback so we never lazy-load later.
+            internal_task_id = task.id
+            user_id = task.user_id
+
             task.status = TaskStatus.PROCESSING
             await db.commit()
-            
+
+            # --- Step A: run the job. Only this is inside the try. ---
             start = time.monotonic()
-            try: 
+            error_message: str | None = None
+            try:
                 await asyncio.wait_for(process_heavy_task(), timeout=10.0)
-                execution_time_ms = int((time.monotonic() - start) * 1000)
-                
-                task.status = TaskStatus.COMPLETED
-                await db.commit()
-                
-                await metrics_cache.incr_completed(execution_time_ms)
-                await metrics_repo.create_log(
-                    task_id=task.id, status="completed", execution_time_ms=execution_time_ms, message=None,
-                )
-                
-                logger.info("Task completed", extra={"context": {"task_id": task_id}})
-            
             except asyncio.TimeoutError:
-                execution_time_ms = int((time.monotonic() - start) * 1000)
-                task.status = TaskStatus.FAILED
-                await db.commit()
-                
-                await metrics_cache.incr_failed()
-                await metrics_repo.create_log(
-                    task_id=task.id, status="failed", execution_time_ms=execution_time_ms, message="Processing timed out"
-                )
-                
-                logger.warning("Task processing timed out", extra={"context": {"task_id": task_id}})
-                
-            except OperationalError:
-                logger.exception("DB unreachable finalizing task status", extra={"context": {"task_id": task_id}})
-                raise 
-            
+                error_message = "Processing timed out"
+                logger.warning("Task processing timed out", extra=ctx)
             except Exception as e:
-                # Catch-all: anything unexpected in the processing step
-                # becomes a recorded FAILED row, not a vanished message.
-                execution_time_ms = int((time.monotonic()-start) *1000)
-                await db.rollback()
-                task.status = TaskStatus.FAILED
-                await db.commit()
-                
-                await metrics_cache.incr_failed()
+                error_message = str(e)
+                logger.exception("Unexpected error during processing", extra=ctx)
+            execution_time_ms = int((time.monotonic() - start) * 1000)
+
+            # --- Step B: record the outcome in the DB (source of truth). ---
+            succeeded = error_message is None
+            task.status = TaskStatus.COMPLETED if succeeded else TaskStatus.FAILED
+            await db.commit()
+
+            # --- Step C: best-effort bookkeeping. Failure here must NOT change task status. ---
+            try:
+                if succeeded:
+                    await metrics_cache.incr_completed(execution_time_ms)
+                else:
+                    await metrics_cache.incr_failed()
+
                 await metrics_repo.create_log(
-                    task_id=task.id, status="failed", execution_time_ms=execution_time_ms, message=str(e)
+                    task_id=internal_task_id,
+                    status="completed" if succeeded else "failed",
+                    execution_time_ms=execution_time_ms,
+                    message=error_message,
                 )
-                logger.exception("Unexpected error during processing", extra={"context": {"task_id": task_id}})
-                
-            keys_to_delete = []
-            async for key in redis_client.scan_iter(match=f"task_history:{task.user_id}:*"):
-                keys_to_delete.append(key)
-            if keys_to_delete:
-                await redis_client.delete(*keys_to_delete)
-            
-            
-            
+                await _invalidate_history_cache(user_id)
+            except Exception:
+                logger.exception("Post-processing bookkeeping failed", extra=ctx)
+
+            logger.info("Task finished", extra={"context": {"task_id": task_id, "status": "completed" if succeeded else "failed"}})
+
+
 async def main():
-    connection = await aio_pika.connect_robust(
-        "amqp://guest:guest@localhost/"
-    )
+    setup_logging()
+    connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
+    try:
+        channel = await connection.channel()
+        await channel.set_qos(prefetch_count=1)
+        queue = await channel.declare_queue("task_queue", durable=True)
+        await queue.consume(process_message)
 
-    channel = await connection.channel()
-    await channel.set_qos(prefetch_count=1) 
-
-    queue = await channel.declare_queue(
-        "task_queue",
-        durable=True,
-    )
-
-    await queue.consume(process_message)
-
-    print("Worker started. Waiting for messages...")
-
-    await asyncio.Future()
+        logger.info("Worker started. Waiting for messages...")
+        await asyncio.Future()
+    finally:
+        await connection.close()
+        listener.stop()
 
 
 if __name__ == "__main__":
