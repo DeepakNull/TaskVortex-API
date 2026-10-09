@@ -25,12 +25,6 @@ async def lifespan(app: FastAPI):
     
     await connect_rabbitmq()
     
-    # await publish_message(
-    # {
-    #     "hello": "world"
-    # }
-# )
-    # await publish_message({"message": "Application started", "type":"startup_test"})
 
     try:
         yield
@@ -38,17 +32,7 @@ async def lifespan(app: FastAPI):
         await close_rabbitmq()
         listener.stop()
         logger.info("Application shutting down")
-        
-
-
-
-# @asynccontextmanager 
-# async def lifespan(app: FastAPI):
-#     async with engine.begin() as conn:
-#         await conn.run_sync(Base.metadata.create_all)
-#     yield 
-#     await engine.dispose()
-
+    
 
 app = FastAPI(
     title="TaskVortex API",

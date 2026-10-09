@@ -57,7 +57,7 @@ services:
       - taskvortex-net
 
     healthcheck:
-      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity" ]
       interval: 5s
       timeout: 10s
       retries: 10

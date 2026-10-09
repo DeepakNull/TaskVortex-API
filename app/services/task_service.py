@@ -9,13 +9,16 @@ from app.repository.metrics_cache_repository import MetricsCacheRepository
 from app.repository.task_repository import TaskRepository
 from fastapi import BackgroundTasks, HTTPException
 from uuid import UUID, uuid4
-import asyncio
+
 import json
+
+from datetime import datetime, timezone
+from app.core.cache import invalidate_task_history
+from app.schemas.task import TaskAccepted, TaskCreate, TaskUpdate
 from app.core.redis import redis_client
 
 from app.core.database import AsyncSessionLocal
 
-from app.schemas.task import TaskCreate, TaskUpdate
 from app.core.logging import trace_id_var
 
 from app.services.message_publisher import publish_message
@@ -25,115 +28,47 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def _to_naive_utc(dt: datetime | None) -> datetime | None:
+    """created_at is a naive column; convert tz-aware inputs so asyncpg doesn't raise."""
+    if dt is not None and dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
 class TaskService:
     def __init__(self, db:AsyncSession):
         self.db = db
         self.task_repo = TaskRepository(db)
         self.metrics_cache_repo = MetricsCacheRepository() 
         
-    async def create_task(
-        self, 
-        task:TaskCreate, 
-        user_id: UUID, 
-        background_tasks: BackgroundTasks
-        ) -> Task | dict:        
-        
-        if task.complexity == "light":
-            
-            task_obj = Task(
-                title = task.title,
-                description = task.description,
-                priority = task.priority,
-                task_type = task.task_type,
-                payload = task.payload,
-                status = TaskStatus.COMPLETED,
-                user_id = user_id,
-            )
-            await self.task_repo.save(task_obj)
-            await self.db.commit()
-            await self.db.refresh(task_obj)
-            
-            logger.info(
-            "Light task created",
-            extra={
-                "context": {
-                    "task_id": task_obj.id,
-                    "user_id": user_id,
-                }
-            }
+    
+    async def create_task(self, task: TaskCreate, user_id: UUID) -> TaskAccepted:
+        is_light = task.complexity == "light"
+
+        task_obj = Task(
+            id=generate_uuid(),
+            title=task.title,
+            description=task.description,
+            task_type=task.task_type,
+            priority=task.priority,
+            payload=task.payload,
+            status=TaskStatus.COMPLETED if is_light else TaskStatus.QUEUED,
+            user_id=user_id,
         )
-            
-            #invalidate cache
-            keys_to_delete = []
-            async for key in redis_client.scan_iter(match=f"task_history:{user_id}:*"):
-                keys_to_delete.append(key)
-                
-            if keys_to_delete:
-                await redis_client.delete(*keys_to_delete)
-                
-            logger.info(
-                "Task history cache invalidated",
-                extra={
-                    "context": {
-                        "user_id": user_id,
-                        "deleted_keys": len(keys_to_delete),
-                    }
-                }
-            )
-            # keys = await redis_client.keys(f"task_history:{user_id}:*")
-            # if keys:
-            #     await redis_client.delete(*keys)
-            return task_obj
-        
-        else:
-            # token = uuid4()
-            task_obj = Task(
-                id=generate_uuid(),
-                title = task.title,
-                description = task.description,
-                task_type = task.task_type,
-                priority = task.priority,
-                payload = task.payload,
-                status = TaskStatus.QUEUED,
-                user_id = user_id,
-            )
-            await self.task_repo.save(task_obj)
-            
-            await self.db.commit()
-            await self.db.refresh(task_obj)
-            
-            await self.metrics_cache_repo.incr_ingested()
-            
-            logger.info(
-                "Heavy task queued",
-                extra={
-                    "context": {
-                        "task_id": task_obj.id,
-                        "user_id": user_id,
-                    }
-                }
-            )
-            
-            # #invalidate cache
-            keys_to_delete = []
-            async for key in redis_client.scan_iter(match=f"task_history:{user_id}:*"):
-                keys_to_delete.append(key)
-                
-            if keys_to_delete:
-                await redis_client.delete(*keys_to_delete)
-                
-            await publish_message(
-                            {
-                                "task_id": str(task_obj.id),
-                                "user_id": str(user_id),
-                            }
-                        )
-                
-            return {
-                "task_id": task_obj.id,
-                "status": task_obj.status,
-                "message": "Task accepted for processing",
-            }
+        await self.task_repo.save(task_obj)
+        await self.db.commit()
+        await self.db.refresh(task_obj)
+
+        deleted = await invalidate_task_history(user_id)
+        ctx = {"context": {"task_id": task_obj.id, "user_id": user_id, "deleted_cache_keys": deleted}}
+
+        if is_light:
+            logger.info("Light task created", extra=ctx)
+            return TaskAccepted(task_id=task_obj.id, status=task_obj.status, message="Task completed")
+
+        await self.metrics_cache_repo.incr_ingested()
+        await publish_message({"task_id": str(task_obj.id), "user_id": str(user_id)})
+        logger.info("Heavy task queued", extra=ctx)
+        return TaskAccepted(task_id=task_obj.id, status=task_obj.status, message="Task accepted for processing")
     
             
     async def get_task_history(
@@ -148,6 +83,9 @@ class TaskService:
         if search_query:
             search_query = search_query.strip() 
             
+        start_date = _to_naive_utc(start_date)
+        end_date = _to_naive_utc(end_date)
+            
         cache_key = (
             f"task_history:"
             f"{user_id}:"
@@ -161,7 +99,6 @@ class TaskService:
         cached_data = await redis_client.get(cache_key)
 
         if cached_data:
-            print(trace_id_var.get())
             # print("Cache Hit")
             logger.info("Cache Hit",
                     extra={
@@ -172,8 +109,6 @@ class TaskService:
                     })
             
             return json.loads(cached_data)
-        
-        print(trace_id_var.get())
 
         # print("Cache Miss")
         logger.info("Cache miss",
@@ -246,21 +181,14 @@ class TaskService:
             }
         )
         
-        keys_to_delete = []
-        async for key in redis_client.scan_iter(match=f"task_history:{user_id}:*"):
-            keys_to_delete.append(key)
+        deleted = await invalidate_task_history(user_id)
+        logger.info("Task history cache invalidated", extra={"context": {"user_id": user_id, "deleted_keys": deleted}})
             
-        if keys_to_delete:
-            await redis_client.delete(*keys_to_delete)
-            
-        logger.info(
-                "Task history cache invalidated",
-                extra={
-                    "context": {
-                        "user_id": user_id,
-                        "deleted_keys": len(keys_to_delete),
-                    }
-                }
-            )
-            
+        return task
+
+    async def get_task(self, task_id: UUID, user_id: UUID) -> Task:
+        task = await self.task_repo.get_task_by_id(task_id)
+        # 404 for other users' tasks too, so IDs can't be probed.
+        if task is None or task.user_id != user_id:
+            raise HTTPException(status_code=404, detail="Task not found")
         return task

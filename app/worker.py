@@ -7,6 +7,7 @@ import aio_pika
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.exc import OperationalError
 
+from app.core.cache import invalidate_task_history
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.logging import listener, setup_logging
@@ -33,10 +34,10 @@ async def _fetch_task_with_retry(repo: TaskRepository, task_id):
     return await repo.get_task_for_processing(task_id)
 
 
-async def _invalidate_history_cache(user_id) -> None:
-    keys = [k async for k in redis_client.scan_iter(match=f"task_history:{user_id}:*")]
-    if keys:
-        await redis_client.delete(*keys)
+# async def _invalidate_history_cache(user_id) -> None:
+#     keys = [k async for k in redis_client.scan_iter(match=f"task_history:{user_id}:*")]
+#     if keys:
+#         await redis_client.delete(*keys)
 
 
 async def process_message(message: aio_pika.IncomingMessage):
@@ -108,7 +109,7 @@ async def process_message(message: aio_pika.IncomingMessage):
                     execution_time_ms=execution_time_ms,
                     message=error_message,
                 )
-                await _invalidate_history_cache(user_id)
+                await invalidate_task_history(user_id)
             except Exception:
                 logger.exception("Post-processing bookkeeping failed", extra=ctx)
 
