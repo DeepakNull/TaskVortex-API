@@ -10,12 +10,15 @@ def hash_password(password: str) -> str:
     salt = bcrypt.gensalt()
     hashed_bytes = bcrypt.hashpw(password_bytes, salt)
     return hashed_bytes.decode('utf-8')
-
+ 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     password_bytes = plain_password.encode('utf-8')
-    hashed_bytes = hashed_password.encode('utf-8')
+    if len(password_bytes) > 72:
+        return False 
+    return bcrypt.checkpw(password_bytes, hashed_password.encode('utf-8'))
     # Securely compare them using constant-time verification against timing attacks
-    return bcrypt.checkpw(password_bytes, hashed_bytes)
+    
+DUMMY_HASH = hash_password("not-a-real-password")
 
 def create_access_token(data:dict)-> str:
     SECRET_KEY = settings.SECRET_KEY

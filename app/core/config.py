@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     
     DATABASE_URL: str
-    TEST_DATABASE_URL: str
+    TEST_DATABASE_URL: str | None = None 
     REDIS_URL: str
     RABBITMQ_URL: str
     SECRET_KEY: str

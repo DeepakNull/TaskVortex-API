@@ -7,6 +7,7 @@ from app.core.database import get_db
 from app.models.user import User
 from app.repository.user_repository import UserRepository
 from app.core.config import settings
+from uuid import UUID 
 
 
 
@@ -22,18 +23,12 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(
-            token, 
-            settings.SECRET_KEY,
-            algorithms=[settings.ALGORITHM]
-        )
-        
-        user_id: str = payload.get("sub")
-        
-        if user_id is None:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        sub = payload.get("sub")
+        if sub is None:
             raise credentials_exception
-        
-    except JWTError:
+        user_id = UUID(sub)
+    except (JWTError, ValueError):
         raise credentials_exception
     
     user_repo = UserRepository(db)
@@ -44,6 +39,3 @@ async def get_current_user(
         raise credentials_exception
     
     return user 
-
-
-#chage the function to get user by id and remove all it's call while creating test data. 

@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.logging import listener, setup_logging
 from app.core.redis import redis_client
+from app.core.rabbitmq import declare_topology 
 from app.models.task import TaskStatus
 from app.repository.metrics_cache_repository import MetricsCacheRepository
 from app.repository.metrics_repository import MetricsRepository
@@ -120,7 +121,7 @@ async def main():
     try:
         channel = await connection.channel()
         await channel.set_qos(prefetch_count=1)
-        queue = await channel.declare_queue("task_queue", durable=True)
+        queue = await declare_topology(channel)
         await queue.consume(process_message)
 
         logger.info("Worker started. Waiting for messages...")
