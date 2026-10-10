@@ -6,7 +6,6 @@ from fastapi.responses import JSONResponse
 
 from app.core.rabbitmq import close_rabbitmq, connect_rabbitmq
 from app.middlewares.rate_limiter import RateLimiterMiddleware
-from app.services.message_publisher import publish_message
 from .api.health import router as health_router
 from .api.v1.tasks import router as tasks_router
 from .api.v1.users import router as user_router
@@ -58,7 +57,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         })
         
     return JSONResponse(
-        status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code = status.HTTP_422_UNPROCESSABLE_CONTENT,
         content = {
             'success': False, 
             "error_type": "ValidationError",
