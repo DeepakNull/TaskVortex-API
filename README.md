@@ -306,7 +306,7 @@ Validation errors use a consistent shape: `{"success": false, "error_type": "Val
 **Prerequisites:** Docker and Docker Compose.
 
 ```bash
-git clone https://github.com/<your-username>/taskvortex.git
+git clone https://github.com/DeepakNull/taskvortex.git
 cd taskvortex
 
 cp .env.example .env
